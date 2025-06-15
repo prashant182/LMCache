@@ -486,6 +486,15 @@ class LMCacheConnectorV1Impl:
             if request.load_spec is None:
                 continue
 
+            request_id = request.req_id
+            load_spec = request.load_spec
+            logger.info(
+                f"🚀 CACHE HIT - start_load_kv: request_id={request_id}, load_spec=LoadSpec("
+                f"vllm_cached={load_spec.vllm_cached_tokens}, "
+                f"lmcache_cached={load_spec.lmcache_cached_tokens}, "
+                f"can_load={load_spec.can_load})"
+            )
+
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = request.slot_mapping.cuda()
@@ -498,6 +507,11 @@ class LMCacheConnectorV1Impl:
                 * self._lmcache_chunk_size
             )
             token_mask[:masked_token_count] = False
+
+            logger.info(
+                f"📊 LOAD DETAILS: tokens={len(tokens)}, masked_count={masked_token_count}, "
+                f"effective_tokens={token_mask.sum().item()}"
+            )
 
             if self.skip_last_n_tokens > 0:
                 tokens = tokens[: -self.skip_last_n_tokens]
@@ -531,6 +545,11 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
+                logger.info(f"🔄 NON-LAYERWISE RETRIEVE: Starting for request {request_id}")
+                logger.info(f"  - Token mask sum: {token_mask.sum().item()}")
+                logger.info(f"  - Tokens to retrieve: {len(tokens)}")
+                logger.info(f"  - Slot mapping shape: {slot_mapping.shape}")
+                
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens,
                     token_mask,
@@ -544,6 +563,10 @@ class LMCacheConnectorV1Impl:
                     request.load_spec.lmcache_cached_tokens
                     - request.load_spec.vllm_cached_tokens
                     - self.skip_last_n_tokens
+                )
+                logger.info(
+                    f"✅ NON-LAYERWISE RETRIEVE COMPLETE: retrieved={num_retrieved_tokens}, "
+                    f"expected={num_expected_tokens}"
                 )
                 if num_retrieved_tokens < num_expected_tokens:
                     logger.error(
@@ -742,12 +765,13 @@ class LMCacheConnectorV1Impl:
             store_mask[:skip_leading_tokens] = False
 
             logger.info(
-                "Storing KV cache for %d out of %d tokens "
-                "(skip_leading_tokens=%d) for request %s",
-                len(token_ids) - skip_leading_tokens,
-                len(token_ids),
-                skip_leading_tokens,
-                request.req_id,
+                f"💾 STORING KV CACHE: {len(token_ids) - skip_leading_tokens} out of {len(token_ids)} tokens "
+                f"(skip_leading_tokens={skip_leading_tokens}) for request {request.req_id}"
+            )
+            logger.info(
+                f"📊 STORE DETAILS: token_ids_shape={token_ids.shape}, "
+                f"slot_mapping_shape={slot_mapping.shape}, "
+                f"kvcaches_len={len(kvcaches)}"
             )
             self.lmcache_engine.store(
                 token_ids,
@@ -756,6 +780,7 @@ class LMCacheConnectorV1Impl:
                 slot_mapping=slot_mapping,
                 offset=skip_leading_tokens,
             )
+            logger.info(f"✅ STORE COMPLETE for request {request.req_id}")
 
     ###################
     # Scheduler side APIs

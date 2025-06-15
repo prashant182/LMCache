@@ -27,12 +27,13 @@ logger = init_logger(__name__)
 
 class LeaseMemoryObj(MemoryObj):
 
-    def __init__(self, offsets, metadata: MemoryObjMetadata, shared_memory_name: str = 'membrain-kvcache', lease_id=None, client=None):
+    def __init__(self, offsets, metadata: MemoryObjMetadata, shared_memory_name: str = 'membrain-kvcache', lease_id=None, client=None, shared_memory=None):
         self.offsets = offsets  # List of {'offset': int, 'len': int} from Membrain lease
         self.meta: MemoryObjMetadata = metadata
         self.shared_memory_name = shared_memory_name  # For GPU connector access
         self.lease_id = lease_id  # Store lease ID for cleanup
         self.client = client  # Store client reference for lease release
+        self.shared_memory = shared_memory  # Pre-initialized shared memory reference
         self.valid = True
         self.lock = threading.Lock()
         self._tensor = None  # Cached tensor
@@ -86,7 +87,6 @@ class LeaseMemoryObj(MemoryObj):
         try:
             import threading
             import requests
-            logger.info(f"CLEANING UP LEASE: {self.lease_id}")
             
             # Mark as released immediately to prevent double cleanup
             self._lease_released = True
@@ -104,7 +104,7 @@ class LeaseMemoryObj(MemoryObj):
                     )
                     
                     if response.status_code == 200:
-                        logger.info(f" LEASE RELEASED SUCCESSFULLY: {self.lease_id}")
+                        logger.debug(f" LEASE RELEASED SUCCESSFULLY: {self.lease_id}")
                     else:
                         logger.warning(f"LEASE RELEASE HTTP ERROR: {self.lease_id}: {response.status_code}")
                         
@@ -158,7 +158,15 @@ class LeaseMemoryObj(MemoryObj):
         try:
             logger.debug(f"LeaseMemoryObj.tensor: Creating tensor from shared memory for non-layerwise compatibility")
             
-            shm = ProtectedSharedMemory(self.shared_memory_name)
+            # Use pre-initialized shared memory if available
+            if self.shared_memory is not None:
+                shm = self.shared_memory
+                should_close = False
+            else:
+                # Fallback to creating a new one
+                shm = ProtectedSharedMemory(self.shared_memory_name)
+                should_close = True
+                
             try:
                 # Parse data format: [4-byte-length][metadata][kv_data]
                 combined_data = bytearray()
@@ -207,8 +215,9 @@ class LeaseMemoryObj(MemoryObj):
                     logger.warning(f"Failed to reshape tensor: {reshape_error}")
                     return None
             finally:
-                # Safe cleanup - never unlinks shared memory
-                shm.close()
+                # Only close if we created it locally
+                if should_close:
+                    shm.close()
                 
         except Exception as e:
             logger.warning(f"Failed to create tensor from shared memory: {e}")
@@ -268,6 +277,15 @@ class MembrainConnector(RemoteConnector):
         self.loop = loop
         # Keep a key mapping cache to be able to track original keys
         self._key_mapping: Dict[str, str] = {}
+        
+        # Initialize shared memory once for Membrain backend
+        self._shared_memory = None
+        try:
+            self._shared_memory = ProtectedSharedMemory('membrain-kvcache')
+            logger.info(f"✅ Initialized shared memory 'membrain-kvcache' for zero-copy access")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not initialize shared memory on startup: {e}")
+        
         logger.info(
             f"Initialized Membrain zero-copy connector: endpoint={endpoint}, namespace={namespace}"
         )
@@ -340,26 +358,31 @@ class MembrainConnector(RemoteConnector):
             bucket, membrain_key = self._get_bucket_and_key(key)
             original_key = key.to_string()
             
-            logger.info(f" MEMBRAIN GET: {membrain_key}")
+            logger.info(f"🔷 MEMBRAIN GET START: {membrain_key} (original: {original_key})")
 
             # Use Membrain lease API for zero-copy access - manual management to avoid race condition
             lease_info = await self.client.acquire_kv_lease_manual(membrain_key)
             if not lease_info or 'offsets' not in lease_info:
-                logger.warning(f"Failed to acquire lease for {membrain_key}")
+                logger.warning(f"❌ Failed to acquire lease for {membrain_key}")
                 return None
                     
             offsets = lease_info['offsets']
             total_bytes = sum(offset['len'] for offset in offsets)
             lease_id = lease_info.get('id')
                 
-            logger.info(f"LEASE ACQUIRED: id={lease_id}, {len(offsets)} segments, {total_bytes:,} bytes")
-            logger.debug(f"LEASE OFFSETS: {offsets}")
+            logger.info(f"📋 LEASE ACQUIRED:")
+            logger.info(f"  - Lease ID: {lease_id}")
+            logger.info(f"  - Segments: {len(offsets)}")
+            logger.info(f"  - Total bytes: {total_bytes:,}")
+            logger.info(f"  - Offsets: {offsets}")
                 
-            # DEBUG: Extensive shared memory analysis  
-            shm = None
+            # Use pre-initialized shared memory
+            shm = self._shared_memory
+            if shm is None:
+                logger.error(f"❌ Shared memory not initialized for Membrain connector")
+                return None
+                
             try:
-                logger.debug(f" ACCESSING SHARED MEMORY: name='membrain-kvcache'")
-                shm = ProtectedSharedMemory('membrain-kvcache')
                 shm_size = shm.size
                 logger.debug(f" SHARED MEMORY SIZE: {shm_size} bytes")
                     
@@ -415,7 +438,8 @@ class MembrainConnector(RemoteConnector):
                                     }),
                                     shared_memory_name='membrain-kvcache',
                                     lease_id=lease_id,
-                                    client=self.client  # Pass client for lease cleanup
+                                    client=self.client,  # Pass client for lease cleanup
+                                    shared_memory=self._shared_memory  # Pass pre-initialized shared memory
                                 )
                                 
                                 logger.info(f" CREATED LEASE MEMORY OBJ: {type(lease_obj)}")
@@ -455,7 +479,8 @@ class MembrainConnector(RemoteConnector):
                     }),
                     shared_memory_name='membrain-kvcache',
                     lease_id=lease_id,
-                    client=self.client
+                    client=self.client,
+                    shared_memory=self._shared_memory  # Pass pre-initialized shared memory  
                 )
                 
                 logger.warning(f"USING FALLBACK LEASE OBJECT")
@@ -476,9 +501,8 @@ class MembrainConnector(RemoteConnector):
                 
                 return None
             finally:
-                # Safe cleanup - never unlinks shared memory
-                if shm is not None:
-                    shm.close()
+                # No cleanup needed - shared memory is managed at connector level
+                pass
 
         except Exception as e:
             # Handle expected cache misses gracefully
@@ -508,7 +532,7 @@ class MembrainConnector(RemoteConnector):
             bucket, membrain_key = self._get_bucket_and_key(key)
             original_key = key.to_string()
 
-            logger.debug(f"Storing key {original_key} -> bucket:{bucket}/key:{membrain_key}")
+            logger.info(f"🔷 MEMBRAIN PUT START: {original_key} -> bucket:{bucket}/key:{membrain_key}")
 
             # Extract data from memory object
             kv_bytes = memory_obj.byte_array
@@ -516,14 +540,24 @@ class MembrainConnector(RemoteConnector):
             kv_dtype = memory_obj.get_dtype()
             memory_format = memory_obj.get_memory_format()
 
-            logger.info(f"MEMBRAIN PUT: kv_shape={kv_shape}; memory_format={memory_format}")
+            logger.info(f"📊 PUT DATA INFO:")
+            logger.info(f"  - Shape: {kv_shape}")
+            logger.info(f"  - Dtype: {kv_dtype}")
+            logger.info(f"  - Memory format: {memory_format}")
+            logger.info(f"  - Data size: {len(kv_bytes):,} bytes")
 
             # Create metadata for reconstruction
             if len(kv_shape) == 3:
+                logger.info(f"  - Reshaping 3D to 4D: {kv_shape} -> {(kv_shape[0], 1, *kv_shape[1:])}")
                 kv_shape = (kv_shape[0], 1, *kv_shape[1:])
 
             metadata = RemoteMetadata(len(kv_bytes), kv_shape, kv_dtype, memory_format)
             metadata_bytes = metadata.serialize()
+
+            # Log metadata details
+            logger.info(f"📋 METADATA CREATED:")
+            logger.info(f"  - Metadata length: {len(metadata_bytes)} bytes")
+            logger.info(f"  - Metadata bytes (first 32): {metadata_bytes[:32].hex()}")
 
             # Combine metadata + data for single Membrain storage
             # Structure: [metadata_length(4 bytes)] + [metadata] + [kv_data]
@@ -534,22 +568,31 @@ class MembrainConnector(RemoteConnector):
                 kv_bytes
             )
 
+            # Log combined data structure
+            logger.info(f"📦 COMBINED DATA STRUCTURE:")
+            logger.info(f"  - Metadata length bytes: {metadata_len.to_bytes(4, byteorder='little').hex()}")
+            logger.info(f"  - Total size: {len(combined_data):,} bytes")
+            logger.info(f"  - First 64 bytes: {combined_data[:64].hex()}")
+
             # Store in Membrain using proper API: PUT /v1/kv/{bucket}/{key}
-            logger.info(
-                f"MEMBRAIN PUT: bucket={bucket}, key={membrain_key}, "
-                f"total_size={len(combined_data)} bytes (metadata={len(metadata_bytes)}, data={len(kv_bytes)})"
-            )
+            logger.info(f"🚀 SENDING TO MEMBRAIN: {len(combined_data):,} bytes")
             
             response = await self.client.put(membrain_key, combined_data)
             
-            logger.info(f"MEMBRAIN PUT SUCCESS: Stored {len(combined_data)} bytes for {original_key}")
-            # Note: PUT success guarantees data is stored - no verification needed
+            logger.info(f"✅ MEMBRAIN PUT SUCCESS: Stored {len(combined_data):,} bytes for {original_key}")
+            
+            # Verify data structure integrity
+            logger.info(f"🔍 VERIFYING PUT DATA:")
+            logger.info(f"  - KV data first 32 bytes: {kv_bytes[:32].hex()}")
+            logger.info(f"  - KV data last 32 bytes: {kv_bytes[-32:].hex()}")
 
             # Clear local cache to free memory
             self.local_cpu_backend.clear()
 
         except Exception as e:
-            logger.error(f"Error putting key {key.to_string()}: {e}")
+            logger.error(f"❌ MEMBRAIN PUT ERROR for {key.to_string()}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
 
     @no_type_check
     async def list(self) -> List[str]:
@@ -558,9 +601,19 @@ class MembrainConnector(RemoteConnector):
         return []
 
     async def close(self):
-        """Close the Membrain client."""
+        """Close the Membrain client and cleanup resources."""
         try:
+            # Close the client
             await self.client.close()
-            logger.info("Closed experimental Membrain connector")
+            
+            # Close the shared memory reference
+            if self._shared_memory is not None:
+                try:
+                    self._shared_memory.close()
+                    logger.info("✅ Closed shared memory reference")
+                except Exception as e:
+                    logger.warning(f"⚠️ Error closing shared memory: {e}")
+            
+            logger.info("Closed Membrain connector")
         except Exception as e:
             logger.error(f"Error closing Membrain connector: {e}")

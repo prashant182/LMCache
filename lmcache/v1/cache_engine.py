@@ -260,16 +260,24 @@ class LMCacheEngine:
             num_stored_tokens = torch.sum(mask).item()
         else:
             num_stored_tokens = len(tokens)
+        
+        logger.info(f"💾 CACHE ENGINE STORE: Starting store for {num_stored_tokens} tokens")
         monitor_req_id = self.stats_monitor.on_store_request(num_stored_tokens)
 
         for start, end, key in self.token_database.process_tokens(tokens, mask):
             assert isinstance(key, CacheEngineKey)
+            logger.info(f"  📦 Processing chunk: start={start}, end={end}, key={key.to_string()}")
+            
             if self.storage_manager.contains(key):
+                logger.info(f"  ⏭️ Skipping - already cached: {key.to_string()}")
                 continue
+                
             # Allocate the memory object
             num_tokens = end - start
             kv_shape = self.gpu_connector.get_shape(num_tokens)
             kv_dtype = self.metadata.kv_dtype
+            logger.info(f"  📊 Allocating: shape={kv_shape}, dtype={kv_dtype}")
+            
             memory_obj = self.storage_manager.allocate(kv_shape, kv_dtype)
             if memory_obj is None:
                 logger.warning(
@@ -277,8 +285,11 @@ class LMCacheEngine:
                     "The KV cache will not be stored."
                 )
                 break
+            logger.info(f"  🚀 Transferring from GPU: start={start}, end={end}")
             self.gpu_connector.from_gpu(memory_obj, start, end, **kwargs)
+            logger.info(f"  ✅ GPU transfer complete, storing to backend")
             self.storage_manager.put(key, memory_obj)
+            logger.info(f"  ✅ Store complete for chunk: {key.to_string()}")
 
             # Update lookup server
             if self.lookup_server is not None:
@@ -321,16 +332,20 @@ class LMCacheEngine:
             num_required_tokens = torch.sum(mask).item()
         else:
             num_required_tokens = len(tokens)
+        
+        logger.info(f"🔍 CACHE ENGINE RETRIEVE: Starting retrieve for {num_required_tokens} tokens")
         monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
         ret_mask = torch.zeros_like(tokens, dtype=torch.bool, device="cpu")
         for start, end, key in self.token_database.process_tokens(tokens, mask):
             assert isinstance(key, CacheEngineKey)
+            logger.info(f"  📦 Processing chunk: start={start}, end={end}, key={key.to_string()}")
 
             # Get the memory object from the storage backend
             memory_obj = self.storage_manager.get(key)
 
             if memory_obj is None:
+                logger.warning(f"  ❌ Cache miss for key: {key.to_string()}")
                 if self.enable_p2p:
                     future_memory_obj = asyncio.run_coroutine_threadsafe(
                         self.distributed_server.issue_get(key),
@@ -341,13 +356,16 @@ class LMCacheEngine:
                     break
 
             ret_mask[start:end] = True
+            logger.info(f"  ✅ Cache hit for key: {key.to_string()}, memory_obj type: {type(memory_obj)}")
 
             # NOTE(Jiayi): memory_obj doesn't have to be a pinned
             # cpu tensor for the sake of performance.
             # For example, disk->gpu is faster than disk->cpu->gpu.
             # RDMA is another example.
+            logger.info(f"  🚀 Transferring to GPU: start={start}, end={end}")
             self.gpu_connector.to_gpu(memory_obj, start, end, **kwargs)
             memory_obj.ref_count_down()
+            logger.info(f"  ✅ GPU transfer complete for chunk")
 
             if isinstance(self.storage_manager, StorageManager):
                 self.storage_manager.batched_unpin([key])

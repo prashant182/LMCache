@@ -135,3 +135,8 @@ test_lmcache_performance.sh
 test_lmcache_heavy_load.sh
 .buildkite/end-to-end-test.sh
 examples/online_session/bench_ttft_sweep.sh
+lmcache/v1/membrain_gpu_connector.py
+kv_cache_explained.md
+kv_code_example.py
+kv_visual_examples.md
+lmcache_vllm_architecture.md
