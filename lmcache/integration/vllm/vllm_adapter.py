@@ -64,7 +64,7 @@ from lmcache.v1.gpu_connector import (
     VLLMPagedMemGPUConnectorV2,
     VLLMPagedMemLayerwiseGPUConnector,
 )
-from lmcache.v1.membrain_gpu_connector import BedrockMembrainGPUConnector
+from lmcache.v1.membrain_gpu_connector_v2 import BedrockMembrainGPUConnectorV2 as BedrockMembrainGPUConnector
 
 # FIXME(Jiayi): temporarily comment this out
 # from lmcache_vllm.blend_adapter import remove_request_id_indices

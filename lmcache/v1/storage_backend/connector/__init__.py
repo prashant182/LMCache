@@ -21,6 +21,7 @@ import re
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.membrain_connector_v2 import SimplifiedMembrainConnector
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.connector.lm_connector import LMCServerConnector
 from lmcache.v1.storage_backend.connector.redis_connector import (
@@ -28,6 +29,7 @@ from lmcache.v1.storage_backend.connector.redis_connector import (
     RedisSentinelConnector,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.membrain_connector import MembrainConnector
 
 # Local
 from .audit_connector import AuditConnector
@@ -265,8 +267,8 @@ def CreateConnector(
             endpoint = f"http://{host}:{port}"
             
             # Import here to avoid circular imports
-            from lmcache.v1.membrain_connector import MembrainConnector
-            connector = MembrainConnector(endpoint, namespace, loop, local_cpu_backend)
+            
+            connector = SimplifiedMembrainConnector(endpoint, namespace, loop, local_cpu_backend)
             
         case _:
             raise ValueError(f"Unknown connector type {connector_type} (url is: {url})")
