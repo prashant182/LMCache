@@ -44,13 +44,13 @@ class ProtectedSharedMemory:
                     pass  # Ignore cleanup errors
             self._shm.__del__ = safe_del
             
-            logger.debug(f"🔒 PROTECTED: Attached to SharedMemory '{self._name}' safely")
+            logger.debug(f"PROTECTED: Attached to SharedMemory '{self._name}' safely")
             
         except FileNotFoundError:
-            logger.warning(f"⚠️ SharedMemory '{self._name}' not found - may not be initialized yet")
+            logger.warning(f"SharedMemory '{self._name}' not found - may not be initialized yet")
             self._attached = False
         except Exception as e:
-            logger.error(f"❌ Failed to attach to SharedMemory '{self._name}': {e}")
+            logger.error(f"Failed to attach to SharedMemory '{self._name}': {e}")
             self._attached = False
     
     @property 
@@ -83,7 +83,7 @@ class ProtectedSharedMemory:
                 if hasattr(self._shm, '_mmap') and self._shm._mmap is not None:
                     self._shm._mmap.close()
                     self._shm._mmap = None
-                logger.debug(f"🔒 PROTECTED: Closed SharedMemory '{self._name}' reference safely")
+                logger.debug(f"PROTECTED: Closed SharedMemory '{self._name}' reference safely")
             except Exception as e:
                 logger.warning(f"Warning closing SharedMemory reference: {e}")
             finally:
@@ -108,7 +108,7 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 return self._parse_multi_segments(memory_obj.offsets, shm, num_tokens)
                 
         except Exception as e:
-            logger.error(f"❌ Parse failed: {e}")
+            logger.error(f"Parse failed: {e}")
             return None, None
 
     def _parse_single_segment(self, offset_info, shm, num_tokens):
@@ -157,7 +157,7 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kv_data = self._extract_kv_data_concurrent(offsets, shm, kv_data_start)
         else:
             # Fallback: metadata spans segments
-            logger.warning("⚠️ Metadata spans segments - using fallback")
+            logger.warning("Metadata spans segments - using fallback")
             combined_data = self._combine_all_segments(offsets, shm)
             metadata = RemoteMetadata.deserialize(combined_data[4:kv_data_start])
             kv_data = combined_data[kv_data_start:]
@@ -166,7 +166,7 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         tensor_dtype = getattr(metadata, 'dtype', getattr(self, 'dtype', torch.float16))
         kv_tensor = torch.frombuffer(kv_data, dtype=tensor_dtype)
         
-        logger.info(f"🔧 MULTI SEGMENT: {len(kv_tensor)} elements from {len(offsets)} segments")
+        logger.info(f" MULTI SEGMENT: {len(kv_tensor)} elements from {len(offsets)} segments")
         return self._finalize_tensor(kv_tensor, num_tokens), metadata
 
     def _extract_kv_data_concurrent(self, offsets, shm, kv_data_start):
@@ -268,12 +268,12 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         expected_elements = num_tokens * 2 * self.hidden_dim_size
         
         if len(kv_tensor) < expected_elements:
-            logger.warning(f"⚠️ Padding: need {expected_elements}, have {len(kv_tensor)}")
+            logger.warning(f"Padding: need {expected_elements}, have {len(kv_tensor)}")
             padded = torch.zeros(expected_elements, dtype=kv_tensor.dtype)
             padded[:len(kv_tensor)] = kv_tensor
             return padded
         elif len(kv_tensor) > expected_elements:
-            logger.warning(f"⚠️ Truncating: need {expected_elements}, have {len(kv_tensor)}")
+            logger.warning(f"Truncating: need {expected_elements}, have {len(kv_tensor)}")
             return kv_tensor[:expected_elements]
         
         return kv_tensor
@@ -320,7 +320,7 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             self._transfer_layers_to_gpu(kv_tensor, kvcaches, slot_mapping, num_tokens, start, end)
             
         except Exception as e:
-            logger.error(f"❌ to_gpu failed: {e}")
+            logger.error(f"to_gpu failed: {e}")
             raise
         finally:
             # Safe cleanup - never unlinks shared memory
@@ -353,9 +353,124 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
     @_lmcache_nvtx_annotate
     def batched_from_gpu(self, memory_objs: List[List[MemoryObj]], starts: List[int], ends: List[int], **kwargs):
-        """Handle layerwise store operations."""
-        logger.debug(f"batched_from_gpu: {len(memory_objs)} layers, {len(starts)} chunks")
-        yield from super().batched_from_gpu(memory_objs, starts, ends, **kwargs)
+        """Handle layerwise store operations with zero-copy Membrain integration.
+        
+        This method detects memory allocation failures and implements a fallback
+        strategy for high concurrency scenarios where local allocation fails.
+        """
+        if "kvcaches" not in kwargs or "slot_mapping" not in kwargs:
+            raise ValueError("'kvcaches' and 'slot_mapping' required in kwargs")
+            
+        kvcaches = kwargs["kvcaches"]
+        slot_mapping = kwargs["slot_mapping"]
+        sync = kwargs.get("sync", True)
+        
+        # Check for memory allocation failures (size-0 tensors)
+        allocation_failed = False
+        for layer_memory_objs in memory_objs:
+            for memory_obj in layer_memory_objs:
+                if (hasattr(memory_obj, 'tensor') and 
+                    memory_obj.tensor is not None and 
+                    memory_obj.tensor.numel() == 0):
+                    allocation_failed = True
+                    break
+            if allocation_failed:
+                break
+        
+        if allocation_failed:
+            logger.warning(
+                "DETECTED MEMORY ALLOCATION FAILURE - Using Membrain zero-copy fallback"
+            )
+            yield from self._membrain_zero_copy_store(
+                memory_objs, starts, ends, kvcaches, slot_mapping, sync
+            )
+        else:
+            logger.debug(f"Using standard store path: {len(memory_objs)} layers, {len(starts)} chunks")
+            yield from super().batched_from_gpu(memory_objs, starts, ends, **kwargs)
+    
+    def _membrain_zero_copy_store(self, memory_objs, starts, ends, kvcaches, slot_mapping, sync):
+        """Zero-copy store implementation that bypasses local memory allocation."""
+        logger.info(f"MEMBRAIN ZERO-COPY: {len(memory_objs)} layers, {len(starts)} chunks")
+        
+        # Prepare slot mapping for all chunks
+        slot_mapping_chunks = []
+        for start, end in zip(starts, ends, strict=False):
+            slot_mapping_chunks.append(slot_mapping[start:end])
+        slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
+        num_tokens = len(slot_mapping_full)
+        
+        # Create temporary GPU buffer for data extraction
+        buffer_shape = self.get_shape(num_tokens)
+        tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+            buffer_shape, self.dtype, MemoryFormat.KV_T2D
+        )
+        
+        if tmp_gpu_buffer_obj is None:
+            logger.error("Failed to allocate temporary GPU buffer for zero-copy store")
+            for layer_id in range(self.num_layers):
+                yield
+            return
+            
+        assert tmp_gpu_buffer_obj.tensor is not None
+        logger.info(f"Allocated temporary GPU buffer: {tmp_gpu_buffer_obj.tensor.shape}")
+        
+        # Process each layer with direct tensor replacement
+        offset = starts[0]
+        current_stream = torch.cuda.current_stream()
+        
+        for layer_id in range(self.num_layers):
+            memory_objs_layer = memory_objs[layer_id]
+            
+            with torch.cuda.stream(self.store_stream):
+                self.store_stream.wait_stream(current_stream)
+                
+                # Extract KV data from vLLM cache to temporary buffer
+                lmc_ops.single_layer_kv_transfer(
+                    tmp_gpu_buffer_obj.tensor,
+                    kvcaches[layer_id][0],  # Key cache
+                    kvcaches[layer_id][1],  # Value cache  
+                    slot_mapping_full,
+                    True,  # store operation
+                    True,  # token_major format
+                )
+                
+                # Copy to CPU and replace memory object tensors
+                cpu_tensor = tmp_gpu_buffer_obj.tensor.cpu()
+                
+                for start, end, memory_obj in zip(starts, ends, memory_objs_layer, strict=False):
+                    chunk_tokens = end - start
+                    chunk_start_idx = start - offset
+                    chunk_end_idx = chunk_start_idx + chunk_tokens
+                    
+                    # Extract chunk data
+                    chunk_tensor = cpu_tensor[chunk_start_idx:chunk_end_idx].contiguous()
+                    
+                    # Replace the failed tensor with our extracted data
+                    if hasattr(memory_obj, 'tensor'):
+                        # Create a properly sized tensor to replace the failed allocation
+                        expected_size = chunk_tokens * 2 * self.hidden_dim_size
+                        if chunk_tensor.numel() != expected_size:
+                            # Reshape to match expected dimensions
+                            chunk_tensor = chunk_tensor.view(chunk_tokens, 2, self.hidden_dim_size)
+                        
+                        # Replace the tensor - this fixes the size mismatch
+                        memory_obj.tensor = chunk_tensor
+                        logger.info(
+                            f"Replaced failed tensor for layer {layer_id}: "
+                            f"shape={chunk_tensor.shape}, size={chunk_tensor.numel()}"
+                        )
+                    else:
+                        logger.warning(f"Memory object has no tensor attribute: {type(memory_obj)}")
+            
+            yield  # Yield after each layer
+            
+            if sync:
+                self.store_stream.synchronize()
+                
+        # Clean up temporary buffer
+        tmp_gpu_buffer_obj.ref_count_down()
+        logger.info("🎯 MEMBRAIN ZERO-COPY store completed")
+        yield  # Final yield
 
     @_lmcache_nvtx_annotate
     def batched_to_gpu(self, starts: List[int], ends: List[int], **kwargs):
@@ -407,7 +522,7 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             else:
                                 logger.warning(f"Expected LeaseMemoryObj, got {type(memory_obj)}")
                         except Exception as e:
-                            logger.error(f"❌ Layer {layer_id} processing failed: {e}")
+                            logger.error(f"Layer {layer_id} processing failed: {e}")
                             raise
 
             yield
@@ -445,4 +560,4 @@ class BedrockMembrainGPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             True,   # token_major: [num_tokens, 2, hidden_dim]
         )
         
-        logger.debug(f"✅ Layer {layer_id} transfer complete")
+        logger.debug(f"Layer {layer_id} transfer complete")

@@ -253,10 +253,10 @@ def init_lmcache_engine(
             # For non-layerwise mode, use regular GPU connector
             # BedrockMembrainGPUConnector is only designed for layerwise operations
             if is_membrain_configured:
-                logger.warning("⚠️  MEMBRAIN + NON-LAYERWISE: Membrain detected but use_layerwise=False!")
-                logger.warning("⚠️  BedrockMembrainGPUConnector requires use_layerwise=True")
-                logger.warning("⚠️  Using regular GPU connector - zero-copy will NOT work")
-                logger.warning("⚠️  To fix: Set use_layerwise=True in your LMCache config")
+                logger.warning(" MEMBRAIN + NON-LAYERWISE: Membrain detected but use_layerwise=False!")
+                logger.warning(" BedrockMembrainGPUConnector requires use_layerwise=True")
+                logger.warning(" Using regular GPU connector - zero-copy will NOT work")
+                logger.warning(" To fix: Set use_layerwise=True in your LMCache config")
             else:
                 logger.info("📋 USING NON-LAYERWISE GPU CONNECTOR (standard)")
             
