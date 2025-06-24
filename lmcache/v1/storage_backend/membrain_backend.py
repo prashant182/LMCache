@@ -28,7 +28,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
@@ -182,12 +182,12 @@ class MembrainBackend(StorageBackendInterface):
         self.timeout_ms = getattr(config, "membrain_timeout_ms", 5000)
 
         # Performance optimizations for scale
-        self.max_connections = getattr(config, "membrain_max_connections", 100)
+        self.max_connections = getattr(config, "membrain_max_connections", 256)
         self.max_connections_per_host = getattr(
-            config, "membrain_max_connections_per_host", 50
+            config, "membrain_max_connections_per_host", 128
         )
         self.serialization_threads = getattr(
-            config, "membrain_serialization_threads", 4
+            config, "membrain_serialization_threads", 16
         )
 
         # HTTP connection pool for high-scale performance
@@ -214,6 +214,7 @@ class MembrainBackend(StorageBackendInterface):
             f"bucket: {self.bucket_name}, "
             f"shared_memory: {self.shared_memory_name}, "
             f"max_connections: {self.max_connections}, "
+            f"max_connections_per_host: {self.max_connections_per_host}, "
             f"serialization_threads: {self.serialization_threads}"
         )
 
@@ -241,17 +242,16 @@ class MembrainBackend(StorageBackendInterface):
         with self.put_lock:
             return key in self.put_tasks
 
+    @_lmcache_nvtx_annotate
     def batched_submit_put_task(
         self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
     ) -> Optional[List[Future]]:
         """Submit batch of PUT tasks to Membrain."""
-        futures = []
         for key, memory_obj in zip(keys, memory_objs, strict=False):
-            future = self.submit_put_task(key, memory_obj)
-            if future is not None:
-                futures.append(future)
-        return futures if futures else None
+            self.submit_put_task(key, memory_obj)
+        return None
 
+    @_lmcache_nvtx_annotate
     def submit_put_task(
         self, key: CacheEngineKey, memory_obj: MemoryObj
     ) -> Optional[Future]:
@@ -261,10 +261,10 @@ class MembrainBackend(StorageBackendInterface):
         with self.put_lock:
             self.put_tasks.add(key)
 
-        future = asyncio.run_coroutine_threadsafe(
-            self._async_put(key, memory_obj), self.loop
+        self.loop.call_soon_threadsafe(
+            asyncio.create_task, self._async_put(key, memory_obj)
         )
-        return future
+        return None
 
     async def _ensure_http_session(self) -> aiohttp.ClientSession:
         """Ensure HTTP session with connection pooling is initialized."""
@@ -329,32 +329,38 @@ class MembrainBackend(StorageBackendInterface):
             logger.error(f"HTTP {method} request failed for {url}: {e}")
             return None
 
+    @_lmcache_nvtx_annotate
     async def _async_put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
-        """Async PUT operation with thread pool for serialization."""
+        """
+        Async PUT operation with thread pool for serialization
+        and early memory release.
+        """
         serialization_start = None
         http_start = None
+        memory_released = False
 
         try:
             key_str = self._key_to_string(key)
             url = f"{self.membrain_url}/v1/kv/{self.bucket_name}/{key_str}"
 
             # OPTIMIZATION 1: Serialize tensor on thread pool (CPU-bound operation)
-            serialization_start = asyncio.get_event_loop().time()
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
+            serialization_start = loop.time()
             data = await loop.run_in_executor(
                 self.thread_pool, self._memory_obj_to_bytes, memory_obj
             )
-            serialization_time = asyncio.get_event_loop().time() - serialization_start
+            serialization_time = loop.time() - serialization_start
 
-            # Early memory release - tensor copied to bytes
+            # Early memory release - tensor copied to bytes, release GPU memory
             memory_obj.ref_count_down()
+            memory_released = True
 
             # HTTP request on event loop (I/O-bound operation)
-            http_start = asyncio.get_event_loop().time()
+            http_start = loop.time()
             result = await self._http_request(
                 "PUT", url, data=data, timeout=self.timeout_ms / 1000.0
             )
-            http_time = asyncio.get_event_loop().time() - http_start
+            http_time = loop.time() - http_start
 
             if result and result["status"] == 200:
                 logger.debug(
@@ -367,12 +373,13 @@ class MembrainBackend(StorageBackendInterface):
                 logger.error(f"Failed to store key {key}: HTTP {status}")
 
         except Exception as e:
-            logger.error(f"Exception during PUT for key {key}: {e}")
+            logger.exception(f"Exception during PUT for key {key}: {e}")
             # Ensure memory is released even on error
-            try:
-                memory_obj.ref_count_down()
-            except Exception:
-                pass  # May have already been released
+            if not memory_released:
+                try:
+                    memory_obj.ref_count_down()
+                except Exception:
+                    pass  # May have already been released or failed for other reasons
         finally:
             # Always cleanup task tracking
             with self.put_lock:
