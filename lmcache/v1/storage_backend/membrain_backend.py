@@ -55,9 +55,13 @@ class DTypeManager:
         torch.bool: np.bool_,
     }
     
+    # Dtypes that can be stored as raw bytes without size expansion
+    RAW_BYTES_DTYPES = {
+        torch.bfloat16: np.uint16,  # Store bf16 as uint16 (same 16-bit size)
+    }
+    
     # Dtypes that require conversion for numpy/serialization compatibility
     CONVERSION_REQUIRED = {
-        torch.bfloat16: torch.float32,     # bfloat16 -> float32 (numpy doesn't support bfloat16)
         torch.float8_e4m3fn: torch.float32, # float8 -> float32
         torch.float8_e5m2: torch.float32,  # float8 -> float32
         torch.complex64: torch.float32,    # complex -> float32 (flatten to real)
@@ -78,6 +82,10 @@ class DTypeManager:
             # Can serialize directly without conversion
             numpy_dtype = cls.DIRECT_SERIALIZABLE[original_dtype]
             return original_dtype, numpy_dtype
+        elif original_dtype in cls.RAW_BYTES_DTYPES:
+            # Store as raw bytes using equivalent-sized numpy dtype
+            numpy_dtype = cls.RAW_BYTES_DTYPES[original_dtype]
+            return original_dtype, numpy_dtype  # Keep original dtype for metadata
         elif original_dtype in cls.CONVERSION_REQUIRED:
             # Requires conversion for serialization
             serialized_dtype = cls.CONVERSION_REQUIRED[original_dtype]
@@ -100,6 +108,11 @@ class DTypeManager:
         return dtype in cls.CONVERSION_REQUIRED
     
     @classmethod
+    def requires_raw_bytes_handling(cls, dtype: torch.dtype) -> bool:
+        """Check if dtype requires special raw bytes handling."""
+        return dtype in cls.RAW_BYTES_DTYPES
+    
+    @classmethod
     def apply_serialization_conversion(cls, tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.dtype]:
         """Apply necessary conversions for serialization.
         
@@ -112,7 +125,19 @@ class DTypeManager:
         original_dtype = tensor.dtype
         serialized_dtype, _ = cls.get_serialization_info(original_dtype)
         
-        if serialized_dtype != original_dtype:
+        if original_dtype in cls.RAW_BYTES_DTYPES:
+            # Handle raw bytes dtypes (e.g., bfloat16) by reinterpreting as equivalent uint type
+            if original_dtype == torch.bfloat16:
+                # Reinterpret bfloat16 data as uint16 - same size, no data expansion
+                converted_tensor = tensor.view(torch.uint16)
+                logger.debug(f"Reinterpreting {original_dtype} as uint16 for raw bytes serialization")
+                return converted_tensor, original_dtype  # Keep original dtype for metadata
+            else:
+                # Future raw bytes dtypes can be added here
+                logger.warning(f"Unhandled raw bytes dtype {original_dtype}, falling back to conversion")
+                converted_tensor = tensor.to(torch.float32)
+                return converted_tensor, torch.float32
+        elif serialized_dtype != original_dtype:
             # Conversion required
             if original_dtype in [torch.complex64, torch.complex128]:
                 # Special handling for complex numbers - could take real part or flatten
@@ -468,22 +493,39 @@ class MembrainBackend(StorageBackendInterface):
             original_dtype = getattr(torch, original_dtype_str.replace('torch.', ''))
             serialized_dtype = getattr(torch, serialized_dtype_str.replace('torch.', ''))
 
-            # Use centralized dtype manager for numpy conversion
-            numpy_dtype = DTypeManager.get_numpy_dtype_from_torch(serialized_dtype)
-
-            # Zero-copy numpy array creation
-            if isinstance(tensor_data, memoryview):
-                numpy_array = np.frombuffer(tensor_data, dtype=numpy_dtype)
+            # Check if this was stored using raw bytes approach
+            if DTypeManager.requires_raw_bytes_handling(original_dtype):
+                # Handle raw bytes deserialization
+                if original_dtype == torch.bfloat16:
+                    # Data was stored as uint16, reinterpret back to bfloat16
+                    numpy_dtype = np.uint16
+                    
+                    # Zero-copy numpy array creation
+                    numpy_array = np.frombuffer(tensor_data, dtype=numpy_dtype)
+                    
+                    # Create uint16 tensor first, then reinterpret as bfloat16
+                    uint16_tensor = torch.from_numpy(numpy_array).reshape(shape)
+                    reconstructed_tensor = uint16_tensor.view(torch.bfloat16)
+                    logger.debug(f"Reinterpreted uint16 back to {original_dtype} for raw bytes deserialization")
+                else:
+                    # Future raw bytes dtypes can be handled here
+                    logger.warning(f"Unhandled raw bytes dtype {original_dtype} during deserialization")
+                    return None
             else:
+                # Standard deserialization path
+                # Use centralized dtype manager for numpy conversion
+                numpy_dtype = DTypeManager.get_numpy_dtype_from_torch(serialized_dtype)
+
+                # Zero-copy numpy array creation
                 numpy_array = np.frombuffer(tensor_data, dtype=numpy_dtype)
 
-            # Create tensor without unnecessary copy
-            reconstructed_tensor = torch.from_numpy(numpy_array).reshape(shape)
+                # Create tensor without unnecessary copy
+                reconstructed_tensor = torch.from_numpy(numpy_array).reshape(shape)
 
-            # Convert back to original dtype if serialization required conversion
-            if original_dtype != serialized_dtype:
-                reconstructed_tensor = reconstructed_tensor.to(original_dtype)
-                logger.debug(f"Converted tensor back from {serialized_dtype} to {original_dtype}")
+                # Convert back to original dtype if serialization required conversion
+                if original_dtype != serialized_dtype:
+                    reconstructed_tensor = reconstructed_tensor.to(original_dtype)
+                    logger.debug(f"Converted tensor back from {serialized_dtype} to {original_dtype}")
 
             # Allocate memory object with correct format
             memory_obj = self.memory_allocator.allocate(shape, original_dtype, memory_format)

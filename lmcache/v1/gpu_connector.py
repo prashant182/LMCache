@@ -845,6 +845,28 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             # TODO(Jiayi): Support `use_gpu=False` case
             pass
 
+    def _lazy_initialize_buffer(self, kv_caches):
+        """
+        Lazily initialize the GPU buffer allocator if it is not initialized yet.
+        Currently, we use the `kv_caches` (kv cache pointer) to determine
+        the gpu buffer size in gpu connector.
+        Also, the first request might be a bit slower due to buffer creation.
+        """
+        if self.use_gpu and self.gpu_buffer_allocator is None:
+            logger.info("Lazily initializing GPU buffer.")
+            # NOTE (Jiayi): We use the first layer to determine the gpu buffer size.
+            # NOTE (Jiayi): Using the exact number of tokens in the first layer
+            # is okay since fragmentation shouldn't exist in the `gpu_buffer_allocator`
+            # in layerwise mode.
+            k_cache_shape_per_layer = kv_caches[0][0].shape
+            max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
+            logger.info(f"Lazily initializing GPU buffer (max tokens={max_tokens}).")
+            num_elements = k_cache_shape_per_layer.numel() * 2
+            gpu_buffer_size = num_elements * self.element_size
+            self.gpu_buffer_allocator = GPUMemoryAllocator(
+                gpu_buffer_size, device=self.device
+            )
+
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """ """
 
