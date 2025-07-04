@@ -18,13 +18,10 @@ from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import List, Optional, Tuple
 import asyncio
-import json
 import threading
 
 # Third Party
 import aiohttp
-import numpy as np
-import torch
 
 # First Party
 from lmcache.logging import init_logger
@@ -32,111 +29,12 @@ from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
-    MemoryFormat,
     MemoryObj,
 )
+from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 
 logger = init_logger(__name__)
-
-
-class DTypeManager:
-    """Centralized dtype management for MembrainBackend serialization.
-
-    Handles torch.dtype <-> numpy.dtype conversions and serialization compatibility.
-    Single source of truth for all dtype-related operations.
-    """
-
-    # Direct serializable dtypes (no conversion needed for numpy compatibility)
-    DIRECT_SERIALIZABLE = {
-        torch.float32: np.float32,
-        torch.float16: np.float16,
-        torch.int32: np.int32,
-        torch.int64: np.int64,
-        torch.int16: np.int16,
-        torch.int8: np.int8,
-        torch.uint8: np.uint8,
-        torch.bool: np.bool_,
-    }
-
-    # Dtypes that require conversion for numpy/serialization compatibility
-    CONVERSION_REQUIRED = {
-        torch.bfloat16: torch.float32,  # bfloat16 -> float32 (numpy doesn't support bfloat16)  # noqa: E501
-        torch.float8_e4m3fn: torch.float32,  # float8 -> float32
-        torch.float8_e5m2: torch.float32,  # float8 -> float32
-        torch.complex64: torch.float32,  # complex -> float32 (flatten to real)
-        torch.complex128: torch.float32,  # complex -> float32
-    }
-
-    @classmethod
-    def get_serialization_info(
-        cls, original_dtype: torch.dtype
-    ) -> Tuple[torch.dtype, np.dtype]:
-        """Get serialization dtype and corresponding numpy dtype for storage.
-
-        Args:
-            original_dtype: The original tensor dtype
-
-        Returns:
-            Tuple of (serialized_torch_dtype, numpy_dtype_for_storage)
-        """
-        if original_dtype in cls.DIRECT_SERIALIZABLE:
-            # Can serialize directly without conversion
-            numpy_dtype = cls.DIRECT_SERIALIZABLE[original_dtype]
-            return original_dtype, numpy_dtype
-        elif original_dtype in cls.CONVERSION_REQUIRED:
-            # Requires conversion for serialization
-            serialized_dtype = cls.CONVERSION_REQUIRED[original_dtype]
-            numpy_dtype = cls.DIRECT_SERIALIZABLE[serialized_dtype]
-            return serialized_dtype, numpy_dtype
-        else:
-            # Unknown dtype - fallback to float32 with warning
-            logger.warning(
-                f"Unknown dtype {original_dtype}, falling back to float32 for serialization"  # noqa: E501
-            )
-            return torch.float32, np.float32
-
-    @classmethod
-    def get_numpy_dtype_from_torch(cls, torch_dtype: torch.dtype) -> np.dtype:
-        """Get numpy dtype from torch dtype (for deserialization)."""
-        _, numpy_dtype = cls.get_serialization_info(torch_dtype)
-        return numpy_dtype
-
-    @classmethod
-    def requires_conversion(cls, dtype: torch.dtype) -> bool:
-        """Check if dtype requires conversion for serialization."""
-        return dtype in cls.CONVERSION_REQUIRED
-
-    @classmethod
-    def apply_serialization_conversion(
-        cls, tensor: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.dtype]:
-        """Apply necessary conversions for serialization.
-
-        Args:
-            tensor: Input tensor
-
-        Returns:
-            Tuple of (converted_tensor, serialized_dtype)
-        """
-        original_dtype = tensor.dtype
-        serialized_dtype, _ = cls.get_serialization_info(original_dtype)
-
-        if serialized_dtype != original_dtype:
-            # Conversion required
-            if original_dtype in [torch.complex64, torch.complex128]:
-                # Special handling for complex numbers - could take real part or flatten
-                logger.debug(
-                    f"Converting complex dtype {original_dtype} to {serialized_dtype}"
-                )
-                converted_tensor = tensor.real.to(serialized_dtype)
-            else:
-                # Standard conversion
-                converted_tensor = tensor.to(serialized_dtype)
-            return converted_tensor, serialized_dtype
-        else:
-            # No conversion needed
-            return tensor, original_dtype
 
 
 @dataclass
@@ -211,8 +109,7 @@ class MembrainBackend(StorageBackendInterface):
         self.shared_memory_map: Optional[memoryview] = None
         self.shared_memory_lock = threading.Lock()
 
-        # CUDA optimization: separate streams for operations
-        self.serialization_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        # Note: No CUDA streams needed for simple byte array approach
 
         logger.info(
             f"MembrainBackend initialized with URL: {self.membrain_url}, "
@@ -474,99 +371,88 @@ class MembrainBackend(StorageBackendInterface):
                 )
                 return None
 
-            # Parse format: [4 bytes metadata size][metadata json][tensor bytes]
-            if len(total_data) < 4:
+            # Parse simple format: [RemoteMetadata struct][byte_array]
+            metadata_size = 4 * 7  # RemoteMetadata is 7 integers
+            if len(total_data) < metadata_size:
                 logger.error("Insufficient data for metadata header")
                 return None
 
-            metadata_size = int.from_bytes(total_data[:4], "little")
-            if len(total_data) < 4 + metadata_size:
-                logger.error("Insufficient data for metadata")
+            try:
+                # Parse using existing RemoteMetadata
+                metadata = RemoteMetadata.deserialize(total_data[:metadata_size])
+                kv_bytes = total_data[metadata_size : metadata_size + metadata.length]
+
+                if len(kv_bytes) != metadata.length:
+                    logger.error(
+                        f"Data size mismatch: expected {metadata.length}, "
+                        f"got {len(kv_bytes)}"
+                    )
+                    return None
+
+                # Simple reconstruction using existing allocator
+                return await self._create_simple_tensor_from_metadata(
+                    key, metadata, kv_bytes
+                )
+
+            except Exception as e:
+                logger.error(f"Failed to parse simple metadata: {e}")
                 return None
-
-            # Extract metadata and tensor data
-            metadata_json = total_data[4 : 4 + metadata_size].decode("utf-8")
-            tensor_metadata = json.loads(metadata_json)
-            tensor_bytes = bytes(total_data[4 + metadata_size :])
-
-            if len(tensor_bytes) != tensor_metadata["tensor_size"]:
-                logger.error("Tensor size mismatch")
-                return None
-
-            # Reconstruct tensor using centralized dtype handling
-            return await self._create_tensor_from_metadata_and_data(
-                key, tensor_metadata, tensor_bytes
-            )
 
         except Exception as e:
             logger.error(f"Error reading tensor from lease for key {key}: {e}")
             return None
 
-    async def _create_tensor_from_metadata_and_data(
-        self, key: CacheEngineKey, tensor_metadata: dict, tensor_data
+    async def _create_simple_tensor_from_metadata(
+        self, key: CacheEngineKey, metadata: RemoteMetadata, kv_bytes: bytes
     ) -> Optional[MemoryObj]:
-        """Create tensor from metadata and data with minimal copying and centralized dtype handling."""  # noqa: E501
+        """Simple tensor reconstruction using Redis-style approach."""
         try:
-            # Parse tensor metadata
-            shape = torch.Size(tensor_metadata["shape"])
-            original_dtype_str = tensor_metadata["original_dtype"]
-            serialized_dtype_str = tensor_metadata["serialized_dtype"]
-            memory_format = MemoryFormat(tensor_metadata["format"])
+            # RemoteMetadata uses 4D padded shape - restore original shape
+            # by removing trailing zeros
+            original_shape = metadata.shape
+            # Remove trailing zeros to get the actual shape
+            actual_shape_list = []
+            for dim in original_shape:
+                if dim == 0 and len(actual_shape_list) > 0:
+                    # Stop at first zero after we have at least one dimension
+                    break
+                actual_shape_list.append(dim)
 
-            # Parse dtype strings safely
-            original_dtype = getattr(torch, original_dtype_str.replace("torch.", ""))
-            serialized_dtype = getattr(
-                torch, serialized_dtype_str.replace("torch.", "")
+            # Convert back to torch.Size
+            # Third Party
+            import torch
+
+            actual_shape = (
+                torch.Size(actual_shape_list) if actual_shape_list else torch.Size([1])
             )
 
-            # Use centralized dtype manager for numpy conversion
-            numpy_dtype = DTypeManager.get_numpy_dtype_from_torch(serialized_dtype)
-
-            # Zero-copy numpy array creation
-            numpy_array = np.frombuffer(tensor_data, dtype=numpy_dtype)
-
-            # Create tensor without unnecessary copy
-            reconstructed_tensor = torch.from_numpy(numpy_array).reshape(shape)
-
-            # Convert back to original dtype if serialization required conversion
-            if original_dtype != serialized_dtype:
-                reconstructed_tensor = reconstructed_tensor.to(original_dtype)
-                logger.debug(
-                    f"Converted tensor back from {serialized_dtype} to {original_dtype}"
-                )
-
-            # Allocate memory object with correct format
+            # Allocate memory object using existing allocator with actual shape
             memory_obj = self.memory_allocator.allocate(
-                shape, original_dtype, memory_format
+                actual_shape, metadata.dtype, metadata.fmt
             )
             if memory_obj is None:
                 logger.error(f"Failed to allocate memory for key {key}")
                 return None
 
-            # Efficient device transfer
-            if memory_obj.tensor is not None:
-                if reconstructed_tensor.device != memory_obj.tensor.device:
-                    # Only transfer device if necessary
-                    target_tensor = reconstructed_tensor.to(
-                        memory_obj.tensor.device, non_blocking=True
-                    )
-                    memory_obj.tensor.copy_(target_tensor, non_blocking=True)
-                else:
-                    # Same device - direct copy
-                    memory_obj.tensor.copy_(reconstructed_tensor)
-
-                logger.debug(
-                    f"Reconstructed tensor: shape={shape}, {serialized_dtype}->{original_dtype}, "  # noqa: E501
-                    f"format={memory_format}"
-                )
-                return memory_obj
+            # Direct byte copy - no tensor conversion needed!
+            if isinstance(memory_obj.byte_array, memoryview):
+                view = memory_obj.byte_array
+                if view.format == "<B":
+                    view = view.cast("B")
             else:
-                logger.error(f"Allocated memory object has no tensor for key {key}")  # noqa: E501
-                memory_obj.ref_count_down()
-                return None
+                view = memoryview(memory_obj.byte_array)
+
+            # Copy data directly to byte array
+            view[: metadata.length] = kv_bytes
+
+            logger.debug(
+                f"Simple reconstruction: actual_shape={actual_shape}, "
+                f"dtype={metadata.dtype}, format={metadata.fmt}"
+            )
+            return memory_obj
 
         except Exception as e:
-            logger.error(f"Error creating tensor from metadata for key {key}: {e}")
+            logger.error(f"Error in simple tensor reconstruction for key {key}: {e}")
             return None
 
     async def _ensure_shared_memory(self) -> bool:
@@ -634,8 +520,7 @@ class MembrainBackend(StorageBackendInterface):
             except Exception as e:
                 logger.error(f"Error shutting down thread pool: {e}")
 
-        # CUDA streams cleanup: release references, PyTorch handles the rest
-        self.serialization_stream = None
+        # Note: No CUDA streams to cleanup in simple approach
 
         # Close shared memory resources
         with self.shared_memory_lock:
@@ -671,75 +556,51 @@ class MembrainBackend(StorageBackendInterface):
         return urllib.parse.quote(key_str, safe="")
 
     def _memory_obj_to_bytes(self, memory_obj: MemoryObj) -> bytes:
-        """Convert MemoryObj to bytes for HTTP transmission with metadata header.
+        """Ultra-simple serialization using Redis-style approach.
 
-        Format: [4 bytes metadata size][metadata json][tensor bytes]
-        Uses centralized DTypeManager for consistent dtype handling.
+        Format: [RemoteMetadata struct][byte_array]
+        - Uses existing LMCache protocol
+        - No tensor conversion needed
+        - Works with all dtypes including BFloat16
         """
-        tensor = memory_obj.tensor
-        if tensor is None:
-            return b""
+        # Simple approach: use the existing byte_array from MemoryObj
+        kv_bytes = memory_obj.byte_array
+        kv_shape = memory_obj.get_shape()
+        kv_dtype = memory_obj.get_dtype()
+        memory_format = memory_obj.get_memory_format()
 
-        # Store original properties before conversion
-        original_shape = tensor.shape
-        original_dtype = tensor.dtype
-        original_format = memory_obj.get_memory_format()
-
-        # CUDA optimization: non-blocking GPU->CPU transfer with dedicated stream
-        if tensor.is_cuda:
-            if self.serialization_stream is not None:
-                with torch.cuda.stream(self.serialization_stream):
-                    # Use pinned memory for faster transfer
-                    cpu_tensor = torch.empty_like(tensor, device='cpu', pin_memory=True)
-                    cpu_tensor.copy_(tensor, non_blocking=True)
-                    # Only synchronize the serialization stream, not all CUDA operations
-                    self.serialization_stream.synchronize()
-                    tensor = cpu_tensor
-            else:
-                # Fallback for when CUDA streams not available
-                # This is a global synchronization and waits for everything on the GPU to finish
-                tensor = tensor.cpu()
-
-        # Apply dtype conversion using centralized manager
-        try:
-            converted_tensor, serialized_dtype = (
-                DTypeManager.apply_serialization_conversion(tensor)
+        # RemoteMetadata expects exactly 4 dimensions - pad with zeros if needed
+        # Following the protocol.py comment:
+        # "Pass in shape [x, 0, 0, 0] if it is a bytes memory object"
+        padded_shape = list(kv_shape) + [0] * (4 - len(kv_shape))
+        if len(padded_shape) > 4:
+            # If shape has more than 4 dimensions, we need to flatten or
+            # handle differently
+            logger.warning(
+                f"Shape has {len(kv_shape)} dimensions, "
+                f"truncating to first 4: {kv_shape}"
             )
-            tensor_bytes = converted_tensor.numpy().tobytes()
-        except Exception as e:
-            logger.error(
-                f"Failed to convert tensor to bytes, dtype={tensor.dtype}: {e}"
-            )
-            # Emergency fallback - should rarely happen with proper DTypeManager
-            try:
-                fallback_tensor = tensor.to(torch.float32)
-                tensor_bytes = fallback_tensor.numpy().tobytes()
-                serialized_dtype = torch.float32
-                logger.warning(
-                    f"Used emergency fallback conversion for dtype {original_dtype}"
-                )
-            except Exception as fallback_error:
-                logger.error(f"Emergency fallback also failed: {fallback_error}")
-                return b""
+            padded_shape = list(kv_shape[:4])
 
-        # Create metadata header for proper reconstruction
-        metadata_dict = {
-            "shape": list(original_shape),
-            "original_dtype": str(original_dtype),
-            "serialized_dtype": str(serialized_dtype),
-            "format": original_format.value,
-            "tensor_size": len(tensor_bytes),
-        }
+        # Convert to torch.Size with exactly 4 dimensions
+        # Third Party
+        import torch
 
-        # Serialize metadata as JSON bytes
-        metadata_json = json.dumps(metadata_dict).encode("utf-8")
-        metadata_size = len(metadata_json)
+        padded_torch_shape = torch.Size(padded_shape)
 
-        # Format: [4 bytes metadata size][metadata json][tensor bytes]
-        result = metadata_size.to_bytes(4, "little") + metadata_json + tensor_bytes
+        # Use existing RemoteMetadata from protocol.py
+        metadata = RemoteMetadata(
+            len(kv_bytes), padded_torch_shape, kv_dtype, memory_format
+        )
+        metadata_bytes = metadata.serialize()
+
+        # Format: [metadata][byte_array]
+        result = metadata_bytes + kv_bytes
 
         logger.debug(
-            f"Serialized tensor: shape={original_shape}, {original_dtype}->{serialized_dtype}, "  # noqa: E501
-            f"size={len(result)} bytes"
+            f"Simple serialization: original_shape={kv_shape}, "
+            f"padded_shape={padded_torch_shape}, dtype={kv_dtype}, "
+            f"size={len(result)} bytes (metadata: {len(metadata_bytes)}, "
+            f"data: {len(kv_bytes)})"
         )
         return result
