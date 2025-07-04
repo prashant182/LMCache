@@ -51,7 +51,6 @@ class DTypeManager:
     DIRECT_SERIALIZABLE = {
         torch.float32: np.float32,
         torch.float16: np.float16,
-        torch.bfloat16: None,  # Raw bytes serialization for bfloat16
         torch.int32: np.int32,
         torch.int64: np.int64,
         torch.int16: np.int16,
@@ -62,17 +61,11 @@ class DTypeManager:
 
     # Dtypes that require conversion for numpy/serialization compatibility
     CONVERSION_REQUIRED = {
+        torch.bfloat16: torch.float32,  # bfloat16 -> float32 (numpy doesn't support bfloat16)  # noqa: E501
         torch.float8_e4m3fn: torch.float32,  # float8 -> float32
         torch.float8_e5m2: torch.float32,  # float8 -> float32
         torch.complex64: torch.float32,  # complex -> float32 (flatten to real)
         torch.complex128: torch.float32,  # complex -> float32
-    }
-
-    # Raw bytes serialization - zero-copy for any dtype
-    RAW_BYTES_DTYPES = {
-        torch.bfloat16,  # Serialize as raw bytes to avoid conversion
-        torch.float8_e4m3fn,  # Can also use raw bytes instead of conversion
-        torch.float8_e5m2,   # Can also use raw bytes instead of conversion
     }
 
     @classmethod
@@ -127,12 +120,6 @@ class DTypeManager:
             Tuple of (converted_tensor, serialized_dtype)
         """
         original_dtype = tensor.dtype
-        
-        # Check if this dtype should use raw bytes serialization
-        if original_dtype in cls.RAW_BYTES_DTYPES:
-            # No conversion needed - will use raw bytes
-            return tensor, original_dtype
-            
         serialized_dtype, _ = cls.get_serialization_info(original_dtype)
 
         if serialized_dtype != original_dtype:
@@ -150,11 +137,6 @@ class DTypeManager:
         else:
             # No conversion needed
             return tensor, original_dtype
-
-    @classmethod
-    def uses_raw_bytes_serialization(cls, dtype: torch.dtype) -> bool:
-        """Check if dtype uses raw bytes serialization."""
-        return dtype in cls.RAW_BYTES_DTYPES
 
 
 @dataclass
@@ -530,7 +512,6 @@ class MembrainBackend(StorageBackendInterface):
             original_dtype_str = tensor_metadata["original_dtype"]
             serialized_dtype_str = tensor_metadata["serialized_dtype"]
             memory_format = MemoryFormat(tensor_metadata["format"])
-            original_sum = tensor_metadata["checksum"]
 
             # Parse dtype strings safely
             original_dtype = getattr(torch, original_dtype_str.replace("torch.", ""))
@@ -538,33 +519,14 @@ class MembrainBackend(StorageBackendInterface):
                 torch, serialized_dtype_str.replace("torch.", "")
             )
 
-            # Check if this was raw bytes serialization
-            if DTypeManager.uses_raw_bytes_serialization(serialized_dtype):
-                # Raw bytes deserialization - match the uint8 serialization approach
-                uint8_tensor = np.frombuffer(tensor_data, dtype=np.uint8)
-                uint16_tensor = uint8_tensor.view(np.uint16)
-                logger.debug(f"New Tensor uint8 Raw Bytes: {uint8_tensor.shape} with {uint8_tensor.dtype} and format")
-                logger.debug(f"New Tensor uint16 Raw Bytes: {uint16_tensor.shape} with {uint16_tensor.dtype} and format ")
+            # Use centralized dtype manager for numpy conversion
+            numpy_dtype = DTypeManager.get_numpy_dtype_from_torch(serialized_dtype)
 
-                # View as the original dtype (serialized_dtype == original_dtype for raw bytes)
-                reconstructed_tensor = torch.from_numpy(uint16_tensor).view(original_dtype).contiguous().reshape(shape)
-                logger.debug(f"Reconstructed Tensor in bf16: {reconstructed_tensor.shape} with {reconstructed_tensor.dtype}")
+            # Zero-copy numpy array creation
+            numpy_array = np.frombuffer(tensor_data, dtype=numpy_dtype)
 
-                # Checksum verification
-                new_sum = torch.sum(reconstructed_tensor).item()
-                if new_sum != original_sum:
-                    logger.error(f"Data Corruption spotted by CheckSum. Expected {original_sum} but got {new_sum}")
-                else:
-                    logger.debug(f"CheckSum Passed: Expected {original_sum} and got {new_sum}")
-            else:
-                # Use centralized dtype manager for numpy conversion
-                numpy_dtype = DTypeManager.get_numpy_dtype_from_torch(serialized_dtype)
-
-                # Zero-copy numpy array creation
-                numpy_array = np.frombuffer(tensor_data, dtype=numpy_dtype)
-
-                # Create tensor without unnecessary copy
-                reconstructed_tensor = torch.from_numpy(numpy_array).reshape(shape)
+            # Create tensor without unnecessary copy
+            reconstructed_tensor = torch.from_numpy(numpy_array).reshape(shape)
 
             # Convert back to original dtype if serialization required conversion
             if original_dtype != serialized_dtype:
@@ -597,14 +559,6 @@ class MembrainBackend(StorageBackendInterface):
                     f"Reconstructed tensor: shape={shape}, {serialized_dtype}->{original_dtype}, "  # noqa: E501
                     f"format={memory_format}"
                 )
-
-                # Checksum verification
-                final_sum = torch.sum(memory_obj.tensor).item()
-                if new_sum != original_sum:
-                    logger.error(f"Data Corruption spotted by CheckSum. Expected {original_sum} but got {final_sum}")
-                else:
-                    logger.debug(f"CheckSum of Final_Sum Passed: Expected {original_sum} and got {final_sum}")
-
                 return memory_obj
             else:
                 logger.error(f"Allocated memory object has no tensor for key {key}")  # noqa: E501
@@ -751,19 +705,7 @@ class MembrainBackend(StorageBackendInterface):
             converted_tensor, serialized_dtype = (
                 DTypeManager.apply_serialization_conversion(tensor)
             )
-            
-            # Use raw bytes serialization for special dtypes like bfloat16
-            if DTypeManager.uses_raw_bytes_serialization(serialized_dtype):
-                # # Use uint8 view approach - numpy doesn't support bfloat16 natively
-                if not converted_tensor.is_contiguous():
-                    converted_tensor = converted_tensor.contiguous()
-                # Serialize as uint8 to avoid numpy bfloat16 issues
-                tensor_bytes = converted_tensor.view(torch.uint8).numpy().tobytes()
-                logger.debug(f"Used raw bytes serialization, produced {len(tensor_bytes)} bytes of data.")
-            else:
-                # Standard numpy-based serialization
-                tensor_bytes = converted_tensor.numpy().tobytes()
-                
+            tensor_bytes = converted_tensor.numpy().tobytes()
         except Exception as e:
             logger.error(
                 f"Failed to convert tensor to bytes, dtype={tensor.dtype}: {e}"
@@ -780,9 +722,6 @@ class MembrainBackend(StorageBackendInterface):
                 logger.error(f"Emergency fallback also failed: {fallback_error}")
                 return b""
 
-        # Calculate checksum for integrity verification
-        checksum = torch.sum(tensor).item()
-        
         # Create metadata header for proper reconstruction
         metadata_dict = {
             "shape": list(original_shape),
@@ -790,7 +729,6 @@ class MembrainBackend(StorageBackendInterface):
             "serialized_dtype": str(serialized_dtype),
             "format": original_format.value,
             "tensor_size": len(tensor_bytes),
-            "checksum": checksum,
         }
 
         # Serialize metadata as JSON bytes
@@ -802,6 +740,6 @@ class MembrainBackend(StorageBackendInterface):
 
         logger.debug(
             f"Serialized tensor: shape={original_shape}, {original_dtype}->{serialized_dtype}, "  # noqa: E501
-            f"size={len(result)} bytes, checksum={checksum}..."
+            f"size={len(result)} bytes"
         )
         return result
