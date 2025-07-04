@@ -146,7 +146,7 @@ FROM base AS image-release
 
 # Install LMCache and vLLM stable releases
 RUN . /opt/venv/bin/activate && \
-uv pip install vllm && \
+uv pip install vllm[runai,tensorizer] && \
     uv pip install lmcache --verbose
 
 WORKDIR /workspace
