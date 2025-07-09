@@ -415,6 +415,7 @@ class LMCacheConnectorV1Impl:
             )
         elif role == KVConnectorRole.SCHEDULER:
             self.lookup_client = LMCacheLookupClient(role, is_tp, vllm_config)
+            self._requests_in_step: dict[str, Request] = {}
         else:
             self.lmcache_engine = init_lmcache_engine(
                 vllm_config.model_config,
@@ -545,7 +546,6 @@ class LMCacheConnectorV1Impl:
         for idx, request in enumerate(metadata.requests):
             if request.load_spec is None:
                 continue
-            last_idx = idx
 
         self.layerwise_retrievers = []
         for idx, request in enumerate(metadata.requests):
@@ -565,16 +565,9 @@ class LMCacheConnectorV1Impl:
             )
             token_mask[:masked_token_count] = False
 
-            if self.skip_last_n_tokens > 0:
-                tokens = tokens[: -self.skip_last_n_tokens]
-                token_mask = token_mask[: -self.skip_last_n_tokens]
-
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             if self.use_layerwise:
-                if idx == last_idx:
-                    sync = True
-                else:
-                    sync = False
+                sync = True
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
@@ -680,8 +673,6 @@ class LMCacheConnectorV1Impl:
         if self.current_layer == 0:
             self.layerwise_storers = []
 
-            is_first = False
-
             for idx, request in enumerate(connector_metadata.requests):
                 save_spec = request.save_spec
                 if save_spec is None or not save_spec.can_save:
@@ -727,11 +718,7 @@ class LMCacheConnectorV1Impl:
                     skip_leading_tokens,
                     request.req_id,
                 )
-                if not is_first:
-                    sync = True
-                    is_first = True
-                else:
-                    sync = False
+                sync = True
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
@@ -909,6 +896,8 @@ class LMCacheConnectorV1Impl:
         For SharedStorageConnector, update _request_needs_load
         if the CacheManager this allocated blocks for us.
         """
+
+        self._requests_in_step[request.request_id] = request
 
         if request.request_id not in self.load_specs:
             # No KV tokens from external KV cache, return
