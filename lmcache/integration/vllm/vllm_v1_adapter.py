@@ -979,11 +979,20 @@ class LMCacheConnectorV1Impl:
                 meta.add_request(req_meta)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
-        for cached_req in cached_reqs:
-            req_id = cached_req.req_id
+        for i, req_id in enumerate(cached_reqs.req_ids):
             request_tracker = self._request_trackers[req_id]
-            new_token_ids = cached_req.new_token_ids
-            new_block_ids = cached_req.new_block_ids
+            num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            if request := self._requests_in_step.get(req_id):
+                num_current_tokens = len(request_tracker.token_ids)
+                new_token_ids = request.all_token_ids[
+                    num_current_tokens : num_current_tokens + num_new_tokens
+                ]
+            else:
+                raise ValueError(
+                    f"Request {req_id} is not in _requests_in_step, "
+                    f"but it is scheduled to be cached"
+                )
+            new_block_ids = cached_reqs.new_block_ids[i]
 
             request_tracker.update(new_token_ids, new_block_ids)
 
