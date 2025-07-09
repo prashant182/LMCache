@@ -405,6 +405,9 @@ class LMCacheConnectorV1Impl:
         self.is_direct_remote_access = self._is_direct_remote_access(config)
         self.layerwise_retrievers = []
 
+        # Initialize this regardless of role to avoid AttributeError
+        self._requests_in_step: dict[str, Request] = {}
+
         # Initialize lmcache engine for non-scheduler role or direct access scheduler
         if role != KVConnectorRole.SCHEDULER or self.is_direct_remote_access:
             self.lmcache_engine = get_or_init_lmcache_engine(
@@ -415,7 +418,6 @@ class LMCacheConnectorV1Impl:
             )
         elif role == KVConnectorRole.SCHEDULER:
             self.lookup_client = LMCacheLookupClient(role, is_tp, vllm_config)
-            self._requests_in_step: dict[str, Request] = {}
         else:
             self.lmcache_engine = init_lmcache_engine(
                 vllm_config.model_config,

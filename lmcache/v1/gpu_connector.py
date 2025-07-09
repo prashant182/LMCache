@@ -319,16 +319,13 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         assert "dtype" in kwargs, "dtype should be provided to create a GPU buffer."
         assert "device" in kwargs, "device should be provided to create a GPU buffer."
 
-            # Use max_tokens from kwargs if provided, otherwise use default
-            max_tokens = kwargs.get("max_tokens", 32000)
-            logger.info(
-                f"Using max_tokens={max_tokens} for VLLMBufferLayerwiseGPUConnector"
-            )
-            shape = self.get_shape(max_tokens)
-            self.dtype = kwargs["dtype"]
-            self.device = kwargs["device"]
-
-            num_elements = shape.numel()
+        max_tokens = kwargs.get("max_tokens", 32000)
+        logger.info(
+            f"Using max_tokens={max_tokens} for VLLMBufferLayerwiseGPUConnector"
+        )
+        self.get_shape(max_tokens)  # Calculate shape (unused)
+        self.dtype = kwargs["dtype"]
+        self.device = kwargs["device"]
 
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
@@ -638,44 +635,35 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         # All sizes are in bytes
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
 
-            # Initialize streaming buffer pool with fixed small buffers
-            # This eliminates dynamic allocation and provides constant memory footprint
-            # Conservative buffer sizing for production stability
-            self.streaming_buffer_size = 512  # tokens per buffer
-            self.num_streaming_buffers = 4  # concurrent operations
+        # Initialize streaming buffer pool with fixed small buffers
+        # This eliminates dynamic allocation and provides constant memory footprint
+        # Conservative buffer sizing for production stability
+        self.streaming_buffer_size = 512  # tokens per buffer
+        self.num_streaming_buffers = 4  # concurrent operations
 
-            logger.info(
-                f"Initializing StreamingBufferPool with {self.num_streaming_buffers} "
-                f"buffers of {self.streaming_buffer_size} tokens each"
-            )
+        logger.info(
+            f"Initializing StreamingBufferPool with {self.num_streaming_buffers} "
+            f"buffers of {self.streaming_buffer_size} tokens each"
+        )
 
-            try:
-                self._init_streaming_buffer_pool()
-                logger.info("StreamingBufferPool initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize streaming buffer pool: {e}")
-                # Graceful fallback - continue without GPU buffers
-                self.streaming_buffers = []
-                self.buffer_available = []
-                self.buffer_lock = threading.Lock()
-                logger.warning(
-                    "Using CPU-only fallback mode - operations will continue"
-                )
-
-            try:
-                self.load_stream = torch.cuda.Stream()
-                self.store_stream = torch.cuda.Stream()
-            except Exception as e:
-                logger.warning(
-                    f"Failed to create CUDA streams: {e}, using default stream"
-                )
-                self.load_stream = None
-                self.store_stream = None
-        else:
-            # CPU-only mode initialization
+        try:
+            self._init_streaming_buffer_pool()
+            logger.info("StreamingBufferPool initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize streaming buffer pool: {e}")
+            # Graceful fallback - continue without GPU buffers
             self.streaming_buffers = []
             self.buffer_available = []
             self.buffer_lock = threading.Lock()
+            logger.warning("Using CPU-only fallback mode - operations will continue")
+
+        try:
+            self.load_stream = torch.cuda.Stream()
+            self.store_stream = torch.cuda.Stream()
+        except Exception as e:
+            logger.warning(f"Failed to create CUDA streams: {e}, using default stream")
+            self.load_stream = None
+            self.store_stream = None
 
     def _init_streaming_buffer_pool(self):
         """Initialize fixed-size streaming buffer pool."""
